@@ -82,7 +82,7 @@ struct representation {
     AVFormatContext *ctx;
     int stream_index;
 
-    char id[20];
+    char id[32];
     char *lang;
     int bandwidth;
     AVRational framerate;
@@ -155,13 +155,14 @@ typedef struct DASHContext {
     /* Flags for init section*/
     int is_init_section_common_video;
     int is_init_section_common_audio;
+    int is_init_section_common_subtitle;
 
 } DASHContext;
 
 static int ishttp(char *url)
 {
     const char *proto_name = avio_find_protocol_name(url);
-    return av_strstart(proto_name, "http", NULL);
+    return proto_name && av_strstart(proto_name, "http", NULL);
 }
 
 static int aligned(int val)
@@ -1041,7 +1042,8 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
     if (rep->fragment_duration > 0 && !rep->fragment_timescale)
         rep->fragment_timescale = 1;
     rep->bandwidth = rep_bandwidth_val ? atoi(rep_bandwidth_val) : 0;
-    strncpy(rep->id, rep_id_val ? rep_id_val : "", sizeof(rep->id));
+    if (rep_id_val)
+        av_strlcpy(rep->id, rep_id_val, sizeof(rep->id));
     rep->framerate = av_make_q(0, 0);
     if (type == AVMEDIA_TYPE_VIDEO) {
         char *rep_framerate_val = xmlGetProp(representation_node, "frameRate");
@@ -1625,8 +1627,15 @@ static struct fragment *get_current_fragment(struct representation *pls)
         }
     }
     if (seg) {
-        char *tmpfilename= av_mallocz(c->max_url_size);
+        char *tmpfilename;
+        if (!pls->url_template) {
+            av_log(pls->parent, AV_LOG_ERROR, "Cannot get fragment, missing template URL\n");
+            av_free(seg);
+            return NULL;
+        }
+        tmpfilename = av_mallocz(c->max_url_size);
         if (!tmpfilename) {
+            av_free(seg);
             return NULL;
         }
         ff_dash_fill_tmpl_params(tmpfilename, c->max_url_size, pls->url_template, 0, pls->cur_seq_no, 0, get_segment_start_time_based_on_timeline(pls, pls->cur_seq_no));
@@ -1637,6 +1646,7 @@ static struct fragment *get_current_fragment(struct representation *pls)
             if (!seg->url) {
                 av_log(pls->parent, AV_LOG_ERROR, "Cannot resolve template url '%s'\n", pls->url_template);
                 av_free(tmpfilename);
+                av_free(seg);
                 return NULL;
             }
         }
@@ -1992,7 +2002,12 @@ static int is_common_init_section_exist(struct representation **pls, int n_pls)
     url_offset = first_init_section->url_offset;
     size = pls[0]->init_section->size;
     for (i=0;i<n_pls;i++) {
-        if (av_strcasecmp(pls[i]->init_section->url,url) || pls[i]->init_section->url_offset != url_offset || pls[i]->init_section->size != size) {
+        if (!pls[i]->init_section)
+            continue;
+
+        if (av_strcasecmp(pls[i]->init_section->url, url) ||
+            pls[i]->init_section->url_offset != url_offset ||
+            pls[i]->init_section->size != size) {
             return 0;
         }
     }
@@ -2079,11 +2094,11 @@ static int dash_read_header(AVFormatContext *s)
     }
 
     if (c->n_subtitles)
-        c->is_init_section_common_audio = is_common_init_section_exist(c->subtitles, c->n_subtitles);
+        c->is_init_section_common_subtitle = is_common_init_section_exist(c->subtitles, c->n_subtitles);
 
     for (i = 0; i < c->n_subtitles; i++) {
         rep = c->subtitles[i];
-        if (i > 0 && c->is_init_section_common_audio) {
+        if (i > 0 && c->is_init_section_common_subtitle) {
             ret = copy_init_section(rep, c->subtitles[0]);
             if (ret < 0)
                 goto fail;

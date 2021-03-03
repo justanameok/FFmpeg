@@ -2009,7 +2009,7 @@ static inline VkFormat drm_to_vulkan_fmt(uint32_t drm_fourcc)
 }
 
 static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **frame,
-                                          AVDRMFrameDescriptor *desc)
+                                          const AVFrame *src)
 {
     int err = 0;
     VkResult ret;
@@ -2020,6 +2020,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
     VulkanDevicePriv *p = ctx->internal->priv;
     VulkanFramesPriv *fp = hwfc->internal->priv;
     AVVulkanFramesContext *frames_hwctx = hwfc->hwctx;
+    const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)src->data[0];
     const int has_modifiers = !!(p->extensions & EXT_DRM_MODIFIER_FLAGS);
     VkSubresourceLayout plane_data[AV_NUM_DATA_POINTERS] = { 0 };
     VkBindImageMemoryInfo bind_info[AV_NUM_DATA_POINTERS] = { 0 };
@@ -2085,7 +2086,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
         };
 
         get_plane_wh(&create_info.extent.width, &create_info.extent.height,
-                     hwfc->sw_format, hwfc->width, hwfc->height, i);
+                     hwfc->sw_format, src->width, src->height, i);
 
         for (int j = 0; j < planes; j++) {
             plane_data[j].offset     = desc->layers[i].planes[j].offset;
@@ -2246,9 +2247,7 @@ static int vulkan_map_from_drm(AVHWFramesContext *hwfc, AVFrame *dst,
     AVVkFrame *f;
     VulkanMapping *map = NULL;
 
-    err = vulkan_map_from_drm_frame_desc(hwfc, &f,
-                                         (AVDRMFrameDescriptor *)src->data[0]);
-    if (err)
+    if ((err = vulkan_map_from_drm_frame_desc(hwfc, &f, src)))
         return err;
 
     /* The unmapping function will free this */
@@ -3253,6 +3252,8 @@ static int vulkan_transfer_data_to_cuda(AVHWFramesContext *hwfc, AVFrame *dst,
     AVCUDADeviceContext *cuda_dev = cuda_cu->hwctx;
     AVCUDADeviceContextInternal *cu_internal = cuda_dev->internal;
     CudaFunctions *cu = cu_internal->cuda_dl;
+    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS s_w_par[AV_NUM_DATA_POINTERS] = { 0 };
+    CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS s_s_par[AV_NUM_DATA_POINTERS] = { 0 };
 
     ret = CHECK_CU(cu->cuCtxPushCurrent(cuda_dev->cuda_ctx));
     if (ret < 0)
@@ -3267,6 +3268,13 @@ static int vulkan_transfer_data_to_cuda(AVHWFramesContext *hwfc, AVFrame *dst,
     }
 
     dst_int = dst_f->internal;
+
+    ret = CHECK_CU(cu->cuWaitExternalSemaphoresAsync(dst_int->cu_sem, s_w_par,
+                                                     planes, cuda_dev->stream));
+    if (ret < 0) {
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
 
     for (int i = 0; i < planes; i++) {
         CUDA_MEMCPY2D cpy = {
@@ -3290,6 +3298,13 @@ static int vulkan_transfer_data_to_cuda(AVHWFramesContext *hwfc, AVFrame *dst,
             err = AVERROR_EXTERNAL;
             goto fail;
         }
+    }
+
+    ret = CHECK_CU(cu->cuSignalExternalSemaphoresAsync(dst_int->cu_sem, s_s_par,
+                                                       planes, cuda_dev->stream));
+    if (ret < 0) {
+        err = AVERROR_EXTERNAL;
+        goto fail;
     }
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
